@@ -143,6 +143,15 @@ class _PIPNetImpl(nn.Module, LandmarksTrainableBase):
 
     def apply_detecting(self, image: np.ndarray) -> np.ndarray:
         return _detecting_impl(net=self, image=image)
+    
+    def preprocess_image(self, image: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        return _preprocess_image(net=self, image=image)
+    
+    def detect_on_image(self, image: np.ndarray, orig_width: int, orig_height: int ) -> np.ndarray:
+        return _detect_on_image( net=self, image=image, orig_width=orig_width, orig_height=orig_height )
+    
+    def detect_on_images_batch(self, batch: torch.Tensor, original_shapes: List[Tuple[int, int]]) -> np.ndarray:
+        return _detect_on_images_batch( net=self, batch=batch, original_shapes=original_shapes )
 
     def apply_training(
             self,
@@ -346,6 +355,192 @@ def _detecting_impl(
     lms_pred_merge[:, 1] *= float(height)  # e.g 256
 
     return lms_pred_merge
+
+
+# # splitting the detection into preprocessing and prediction + postprocessing
+# def preprocess_batch(net: _PIPNetImpl, images: List[np.ndarray]) -> Tuple[torch.Tensor, List[Tuple[int, int]]]:
+#     """
+#     :param images: list of source face images without background, each RGB with HWC and range [0,255]
+#     :return: batched tensor of processed images and list of original shapes
+#     """
+#     if not net.meanface_status:
+#         raise RuntimeError(
+#             f"Can not found any meanface landmarks settings! "
+#             f"Please check and setup meanface carefully before "
+#             f"running PIPNet ..."
+#         )
+
+#     # net.eval()
+#     # device = next(net.parameters()).device
+
+#     batch = []
+#     original_shapes = []
+#     for image in images:
+#         height, width, _ = image.shape
+#         original_shapes.append((width, height))
+#         image = cv2.resize(image, (net.input_size, net.input_size))
+#         image = torch.from_numpy(_normalize(img=image)).contiguous()
+#         batch.append(image)
+
+#     batch = torch.stack(batch)#.to(device)  # Stack images into a single tensor
+
+#     return batch, original_shapes
+
+# splitting the detection into preprocessing and prediction + postprocessing
+def _preprocess_image(net: _PIPNetImpl, image: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """
+    :param images: list of source face images without background, each RGB with HWC and range [0,255]
+    :return: batched tensor of processed images and list of original shapes
+    """
+    height, width, _ = image.shape
+    image: np.ndarray = cv2.resize(image, (net.input_size, net.input_size))  # 256, 256
+    image: Tensor = torch.from_numpy(_normalize(img=image)).contiguous().unsqueeze(0)  # (1,3,256,256)
+
+    return image, (width, height)
+
+@torch.no_grad()
+def _detect_on_image(
+        net: _PIPNetImpl,
+        image: np.ndarray,
+        orig_width: int,
+        orig_height: int
+        
+) -> np.ndarray:
+    """
+    :param image: source face image without background, RGB with HWC and range [0,255]
+    :return: detected landmarks coordinates without normalize, shape [num, 2]
+    """
+    if not net.meanface_status:
+        raise RuntimeError(
+            f"Can not found any meanface landmarks settings! "
+            f"Please check and setup meanface carefully before "
+            f"running PIPNet ..."
+        )
+
+    net.eval()
+    device = next(net.parameters()).device
+
+    # height, width, _ = image.shape
+    # image: np.ndarray = cv2.resize(image, (net.input_size, net.input_size))  # 256, 256
+    # image: Tensor = torch.from_numpy(_normalize(img=image)).contiguous().unsqueeze(0)  # (1,3,256,256)
+    outputs_cls, outputs_x, outputs_y, outputs_nb_x, outputs_nb_y = net.forward(image.to(device))
+    # (1,68,8,8)
+    tmp_batch, tmp_channel, tmp_height, tmp_width = outputs_cls.size()
+    assert tmp_batch == 1
+
+    outputs_cls = outputs_cls.view(tmp_batch * tmp_channel, -1)  # (68,64)
+    max_ids = torch.argmax(outputs_cls, 1)  # (68,)
+    max_ids = max_ids.view(-1, 1)  # (68,1)
+    max_ids_nb = max_ids.repeat(1, net.num_nb).view(-1, 1)  # (68,10) -> (68*10,1)
+
+    outputs_x = outputs_x.view(tmp_batch * tmp_channel, -1)  # (68,64)
+    outputs_x_select = torch.gather(outputs_x, 1, max_ids)  # (68,1)
+    outputs_x_select = outputs_x_select.squeeze(1)  # (68,)
+    outputs_y = outputs_y.view(tmp_batch * tmp_channel, -1)
+    outputs_y_select = torch.gather(outputs_y, 1, max_ids)
+    outputs_y_select = outputs_y_select.squeeze(1)  # (68,)
+
+    outputs_nb_x = outputs_nb_x.view(tmp_batch * net.num_nb * tmp_channel, -1)
+    outputs_nb_x_select = torch.gather(outputs_nb_x, 1, max_ids_nb)  # (68*10,1)
+    outputs_nb_x_select = outputs_nb_x_select.squeeze(1).view(-1, net.num_nb)  # (68,10)
+    outputs_nb_y = outputs_nb_y.view(tmp_batch * net.num_nb * tmp_channel, -1)
+    outputs_nb_y_select = torch.gather(outputs_nb_y, 1, max_ids_nb)
+    outputs_nb_y_select = outputs_nb_y_select.squeeze(1).view(-1, net.num_nb)  # (68,10)
+
+    # tmp_width=tmp_height=8 max_ids->[0,63] calculate grid center (cx,cy) in 8x8 map
+    # https://github.com/jhb86253817/PIPNet/issues/4
+    # lms_pred_x = (max_ids % tmp_width).view(-1, 1).float() + outputs_x_select.view(-1, 1)  # x=cx+offset_x
+    # lms_pred_y = (max_ids // tmp_width).view(-1, 1).float() + outputs_y_select.view(-1, 1)  # y=cy+offset_y
+    lms_pred_x = (max_ids % tmp_width).view(-1, 1).float() + outputs_x_select.view(-1, 1)  # x=cx+offset_x
+    lms_pred_y = torch.floor(max_ids / tmp_width).view(-1, 1).float() + outputs_y_select.view(-1, 1)  # y=cy+offset_y
+    lms_pred_x /= 1.0 * net.input_size / net.net_stride  # normalize coord (x*32)/256
+    lms_pred_y /= 1.0 * net.input_size / net.net_stride  # normalize coord (y*32)/256
+
+    # lms_pred_nb_x = (max_ids % tmp_width).view(-1, 1).float() + outputs_nb_x_select  # (68,10)
+    # lms_pred_nb_y = (max_ids // tmp_width).view(-1, 1).float() + outputs_nb_y_select  # (68,10)
+    # https://github.com/jhb86253817/PIPNet/issues/4
+    lms_pred_nb_x = (max_ids % tmp_width).view(-1, 1).float() + outputs_nb_x_select  # (68,10)
+    lms_pred_nb_y = torch.floor(max_ids / tmp_width).view(-1, 1).float() + outputs_nb_y_select  # (68,10)
+    lms_pred_nb_x = lms_pred_nb_x.view(-1, net.num_nb)  # (68,10)
+    lms_pred_nb_y = lms_pred_nb_y.view(-1, net.num_nb)  # (68,10)
+    lms_pred_nb_x /= 1.0 * net.input_size / net.net_stride  # normalize coord (nx*32)/256
+    lms_pred_nb_y /= 1.0 * net.input_size / net.net_stride  # normalize coord (ny*32)/256
+
+    # merge predictions
+    tmp_nb_x = lms_pred_nb_x[net.reverse_index1, net.reverse_index2].view(net.num_lms, net.max_len)
+    tmp_nb_y = lms_pred_nb_y[net.reverse_index1, net.reverse_index2].view(net.num_lms, net.max_len)
+    tmp_x = torch.mean(torch.cat((lms_pred_x, tmp_nb_x), dim=1), dim=1).view(-1, 1)
+    tmp_y = torch.mean(torch.cat((lms_pred_y, tmp_nb_y), dim=1), dim=1).view(-1, 1)
+    lms_pred_merge = torch.cat((tmp_x, tmp_y), dim=1)  # (68,2)
+    lms_pred_merge = lms_pred_merge.cpu().numpy()  # (68,2)
+
+    # de-normalize
+    lms_pred_merge[:, 0] *= float(orig_width)  # e.g 256
+    lms_pred_merge[:, 1] *= float(orig_height)  # e.g 256
+
+    return lms_pred_merge
+
+@torch.no_grad()
+def _detect_on_images_batch(net: _PIPNetImpl, batch: List[torch.Tensor], original_shapes: List[Tuple[int, int]]) -> np.ndarray:
+    """
+    :param batch: batched tensor of processed images
+    :param original_shapes: list of original shapes of images
+    :return: detected landmarks coordinates without normalize, shape [num_images, num, 2]
+    """
+    
+    if not net.meanface_status:
+        raise RuntimeError(
+            f"Can not found any meanface landmarks settings! "
+            f"Please check and setup meanface carefully before "
+            f"running PIPNet ..."
+        )
+
+    net.eval()
+    device = next(net.parameters()).device
+    
+    
+    outputs_cls, outputs_x, outputs_y, outputs_nb_x, outputs_nb_y = net.forward(torch.stack(batch).squeeze(1).to(device))
+    
+    tmp_batch, tmp_channel, tmp_height, tmp_width = outputs_cls.size()
+
+    # Adjust the reshaping operations for batches
+    max_ids = torch.argmax(outputs_cls.view(tmp_batch, tmp_channel, -1), dim=2)
+    max_ids_nb = max_ids.unsqueeze(2).repeat(1, 1, net.num_nb).view(tmp_batch, -1, 1)
+
+    outputs_x_select = torch.gather(outputs_x.view(tmp_batch, tmp_channel, -1), 2, max_ids.unsqueeze(2)).squeeze(2)
+    outputs_y_select = torch.gather(outputs_y.view(tmp_batch, tmp_channel, -1), 2, max_ids.unsqueeze(2)).squeeze(2)
+
+    outputs_nb_x_select = torch.gather(outputs_nb_x.view(tmp_batch, net.num_nb * tmp_channel, -1), 2, max_ids_nb).squeeze(2).view(tmp_batch, -1, net.num_nb)
+    outputs_nb_y_select = torch.gather(outputs_nb_y.view(tmp_batch, net.num_nb * tmp_channel, -1), 2, max_ids_nb).squeeze(2).view(tmp_batch, -1, net.num_nb)
+
+    lms_pred_x = (max_ids % tmp_width).unsqueeze(2).float() + outputs_x_select.unsqueeze(2)
+    lms_pred_y = (max_ids // tmp_width).unsqueeze(2).float() + outputs_y_select.unsqueeze(2)
+    lms_pred_x /= 1.0 * net.input_size / net.net_stride
+    lms_pred_y /= 1.0 * net.input_size / net.net_stride
+
+    lms_pred_nb_x = (max_ids % tmp_width).unsqueeze(2).float() + outputs_nb_x_select
+    lms_pred_nb_y = (max_ids // tmp_width).unsqueeze(2).float() + outputs_nb_y_select
+    lms_pred_nb_x /= 1.0 * net.input_size / net.net_stride
+    lms_pred_nb_y /= 1.0 * net.input_size / net.net_stride
+
+    tmp_nb_x = lms_pred_nb_x[:, net.reverse_index1, net.reverse_index2].view(tmp_batch, net.num_lms, net.max_len)
+    tmp_nb_y = lms_pred_nb_y[:, net.reverse_index1, net.reverse_index2].view(tmp_batch, net.num_lms, net.max_len)
+    tmp_x = torch.mean(torch.cat((lms_pred_x, tmp_nb_x), dim=2), dim=2, keepdim=True)
+    tmp_y = torch.mean(torch.cat((lms_pred_y, tmp_nb_y), dim=2), dim=2, keepdim=True)
+    lms_pred_merge = torch.cat((tmp_x, tmp_y), dim=2).squeeze(2)
+
+    # Adjust the de-normalization for batches
+    for i in range(tmp_batch):
+        width, height = original_shapes[i]
+        lms_pred_merge[i, :, 0] *= float(width)
+        lms_pred_merge[i, :, 1] *= float(height)
+
+    return lms_pred_merge.cpu().numpy()
+
+
+
+##############
+
 
 
 def _losses_impl(
